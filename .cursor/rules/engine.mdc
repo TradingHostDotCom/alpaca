@@ -1,0 +1,322 @@
+---
+description: Alpaca engine guidance — SDK, broker setup, order types, market hours, and recipes for this strategy
+alwaysApply: true
+---
+
+# Alpaca on TradingHost
+
+You are helping a user build a trading bot using Alpaca. This file covers Alpaca-specific knowledge — the SDK, broker setup, order types, market hours, and recipes. See `tradinghost.mdc` for platform conventions (deployment, env vars, logging, persistence, config).
+
+## Engine Overview
+
+Alpaca is a commission-free brokerage offering US equities, options, and crypto. It provides a REST API, WebSocket streaming, and an official Python SDK (`alpaca-py`). Paper trading is built in — same API, same SDK, separate account with simulated execution.
+
+Key capabilities:
+- **US Equities**: stocks, ETFs, commission-free. Market, limit, stop, stop-limit, and trailing stop orders
+- **Options**: equity options with full chain data, Greeks, exercise/assignment handling
+- **Crypto**: 24/7 crypto trading on select pairs (BTC, ETH, SOL, etc.)
+- **Market Data**: real-time quotes, trades, bars (1Min–1Month), snapshots, historical data
+- **WebSocket Streaming**: real-time trade/quote/bar streams for market data and order updates
+- **Paper Trading**: full simulation environment at `paper-api.alpaca.markets` — same endpoints, fake money
+
+Limitations:
+- US market hours: equities trade 9:30–16:00 ET (pre-market 4:00 ET, after-hours to 20:00 ET with extended hours flag)
+- Pattern Day Trader rule: accounts under $25,000 are limited to 3 day trades per 5 business days
+- Crypto is separate from equities in the API (different base URL for data)
+- Not all order types available for all asset classes — check asset.tradable and asset.fractionable
+
+## Broker Setup
+
+### Step 1: Create an Alpaca Account
+
+1. Go to https://app.alpaca.markets and sign up
+2. After email verification, you'll land on the dashboard
+3. By default, you get a **paper trading** account immediately — no approval needed
+
+### Step 2: Get API Keys
+
+1. On the dashboard, click **API Keys** in the left sidebar (or go to Settings > API Keys)
+2. Click **Generate New Key**
+3. Copy both the **API Key ID** and the **Secret Key** — the secret is shown only once
+4. These are your **paper trading** keys (endpoint: `https://paper-api.alpaca.markets`)
+5. On TradingHost, set them as strategy secrets named `ALPACA_API_KEY` and `ALPACA_API_SECRET` (env vars) — never in `config.json`. See `tradinghost.mdc` → "Secrets & Credentials".
+
+### Step 3: Paper vs Live
+
+- **Paper trading** (default): uses `paper-api.alpaca.markets`. Free, no real money. Set `paper: true` in config.
+- **Live trading**: requires identity verification and account funding. Uses `api.alpaca.markets`. Set `paper: false` in config and use live API keys from the live account section.
+
+Paper and live have **separate API keys**. Never mix them.
+
+### Step 4: Connect in Code
+
+```python
+from alpaca.trading.client import TradingClient
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.live import StockDataStream
+import json, os
+
+DATA_DIR = os.environ.get('TRADINGHOST_DATA_DIR', '/data')
+with open(os.path.join(DATA_DIR, 'config.json')) as f:
+    config = json.load(f)
+
+# Trading client (orders, positions, account)
+API_KEY = os.environ['ALPACA_API_KEY']
+API_SECRET = os.environ['ALPACA_API_SECRET']
+
+trading = TradingClient(API_KEY, API_SECRET, paper=config['paper'])
+
+# Market data client (historical bars, snapshots)
+data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+
+# Real-time streaming (WebSocket)
+stream = StockDataStream(API_KEY, API_SECRET)
+```
+
+### Verifying the Connection
+
+```python
+account = trading.get_account()
+print(f"Account status: {account.status}")
+print(f"Buying power: ${float(account.buying_power):,.2f}")
+print(f"Portfolio value: ${float(account.portfolio_value):,.2f}")
+```
+
+If this prints without error, the connection is working.
+
+## Suggestions
+
+### Market Hours Awareness
+
+Alpaca rejects equity orders outside market hours unless extended hours are enabled. Build in awareness:
+
+```python
+from alpaca.trading.client import TradingClient
+
+clock = trading.get_clock()
+if not clock.is_open:
+    next_open = clock.next_open
+    log('info', 'Market closed', next_open=str(next_open))
+    # Sleep until market opens, or process only crypto
+```
+
+For extended hours trading:
+
+```python
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import TimeInForce
+
+order = MarketOrderRequest(
+    symbol='AAPL',
+    qty=10,
+    side='buy',
+    time_in_force=TimeInForce.DAY,
+    extended_hours=True  # allows pre-market and after-hours
+)
+```
+
+## Recipes
+
+### Adding Symbols
+
+Add to the `symbols` array in `config.json`. The main loop iterates `config['symbols']`:
+
+```python
+for symbol in config['symbols']:
+    # Generate signal, check position, execute
+    ...
+```
+
+New symbols are picked up on restart. If using per-symbol SQLite tracking, the table handles new symbols automatically.
+
+### Adding Indicators (RSI, EMA, MACD)
+
+Use the `ta` library for technical analysis:
+
+```python
+import ta
+import pandas as pd
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from datetime import datetime, timedelta
+
+request = StockBarsRequest(
+    symbol_or_symbols=symbol,
+    timeframe=TimeFrame.Hour,
+    start=datetime.now() - timedelta(days=30),
+)
+bars = data_client.get_stock_bars(request)
+df = bars[symbol].df.reset_index()
+
+# RSI
+df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+
+# EMA
+df['ema_20'] = ta.trend.EMAIndicator(df['close'], window=20).ema_indicator()
+df['ema_50'] = ta.trend.EMAIndicator(df['close'], window=50).ema_indicator()
+
+# MACD
+macd = ta.trend.MACD(df['close'])
+df['macd'] = macd.macd()
+df['macd_signal'] = macd.macd_signal()
+df['macd_diff'] = macd.macd_diff()
+
+# Bollinger Bands
+bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+df['bb_upper'] = bb.bollinger_hband()
+df['bb_lower'] = bb.bollinger_lband()
+```
+
+### Switching Paper to Live
+
+1. Set `paper: false` in `config.json`
+2. Update the `ALPACA_API_KEY` / `ALPACA_API_SECRET` strategy secrets with your **live** keys (live and paper keys are separate)
+3. Verify your live account is funded and approved
+4. Redeploy — the same code runs against the live API (a redeploy is required for the new secrets to take effect)
+
+### Options Trading
+
+Alpaca supports equity options:
+
+```python
+from alpaca.trading.requests import OptionContractRequest
+from alpaca.trading.enums import AssetClass
+
+# Get option contracts for a symbol
+contracts = trading.get_option_contracts(
+    OptionContractRequest(
+        underlying_symbols=['AAPL'],
+        expiration_date_gte='2025-01-17',
+        expiration_date_lte='2025-02-21',
+    )
+)
+
+# Place an option order
+from alpaca.trading.requests import LimitOrderRequest
+order = LimitOrderRequest(
+    symbol='AAPL250117C00150000',  # OCC symbol format
+    qty=1,
+    side='buy',
+    type='limit',
+    limit_price=5.00,
+    time_in_force=TimeInForce.DAY,
+)
+trading.submit_order(order)
+```
+
+### Fetching Historical Data
+
+```python
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from datetime import datetime, timedelta
+
+request = StockBarsRequest(
+    symbol_or_symbols=['AAPL', 'MSFT'],
+    timeframe=TimeFrame.Day,
+    start=datetime.now() - timedelta(days=365),
+)
+bars = data_client.get_stock_bars(request)
+
+# Access as DataFrame
+df = bars['AAPL'].df
+```
+
+### Real-Time Streaming
+
+```python
+import os
+from alpaca.data.live import StockDataStream
+
+stream = StockDataStream(os.environ['ALPACA_API_KEY'], os.environ['ALPACA_API_SECRET'])
+
+async def on_bar(bar):
+    log('info', 'Bar received', symbol=bar.symbol, close=bar.close, volume=bar.volume)
+    # Run strategy logic on each new bar
+
+stream.subscribe_bars(on_bar, *config['symbols'])
+# stream.run() blocks — run in a thread or use asyncio
+```
+
+### Handling Market Hours
+
+```python
+import time
+from datetime import datetime
+import pytz
+
+ET = pytz.timezone('US/Eastern')
+
+def wait_for_market():
+    while True:
+        clock = trading.get_clock()
+        if clock.is_open:
+            return
+        wait_seconds = (clock.next_open - datetime.now(tz=ET)).total_seconds()
+        log('info', 'Waiting for market open', wait_minutes=round(wait_seconds / 60))
+        time.sleep(min(wait_seconds, 300))  # check every 5 min max
+```
+
+### Crypto Trading (24/7)
+
+Crypto uses separate clients but same API keys:
+
+```python
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.live import CryptoDataStream
+from alpaca.trading.requests import MarketOrderRequest
+
+# Crypto data
+crypto_data = CryptoHistoricalDataClient()  # no auth needed for crypto market data
+
+# Crypto orders go through the same TradingClient
+order = MarketOrderRequest(symbol='BTC/USD', qty=0.001, side='buy')
+trading.submit_order(order)
+```
+
+## Risk Management
+
+Always advise the user on risk:
+
+- **Position sizing**: never risk more than 1-2% of portfolio per trade. Use `account.equity` to compute max position size.
+- **Stop losses**: use stop or trailing stop orders. Alpaca supports `trailing_stop` natively:
+  ```python
+  from alpaca.trading.requests import TrailingStopOrderRequest
+  order = TrailingStopOrderRequest(symbol='AAPL', qty=10, side='buy', trail_percent=2.0)
+  ```
+- **PDT rule**: accounts under $25,000 are limited to 3 day trades in 5 business days. Track with `account.daytrade_count`. Warn users before they hit the limit.
+- **Max daily loss**: track daily P&L in SQLite. If drawdown exceeds a threshold (e.g. 3%), cancel all orders and stop trading until next day.
+- **Diversification**: spread across multiple symbols. Don't concentrate in one stock.
+- **Buying power check**: always verify `account.buying_power` before placing an order.
+- **Kill switch**: if total loss exceeds a configurable percentage, cancel all orders, close positions, and halt:
+  ```python
+  if float(account.equity) < float(account.last_equity) * (1 - config.get('max_drawdown_pct', 5) / 100):
+      trading.cancel_orders()
+      for pos in trading.get_all_positions():
+          trading.close_position(pos.symbol)
+      log('error', 'Kill switch triggered — max drawdown exceeded')
+      running = False
+  ```
+
+## Testing
+
+### Paper Trading Workflow
+
+1. Set `paper: true` in `config.json` (this is the default)
+2. Use paper API keys from the Alpaca dashboard
+3. Deploy to TradingHost — the bot trades with simulated money
+4. Monitor via the deployment console and your web panel
+5. Paper accounts come pre-funded with $100,000 simulated cash
+
+### What to Verify Before Going Live
+
+- Bot starts cleanly after a restart (positions and state reconcile correctly)
+- SIGTERM produces clean shutdown (no orphaned orders left on Alpaca)
+- Market hours handling works (bot sleeps or processes crypto outside equity hours)
+- Orders execute with correct sizes and sides
+- Stop losses trigger correctly
+- Logging captures all trades with enough detail to audit
+- Daily P&L tracking is accurate
+- The web panel shows accurate state
+- SQLite state matches Alpaca positions after every operation
+- Paper trading has run for at least several full trading days without errors
